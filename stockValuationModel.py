@@ -84,24 +84,45 @@ class StockValuationModel:
             }
         
         df = self.data.copy()
+        print(f"Starting with {len(df)} stocks")
         
-        # Clean data - remove rows with too many missing values
-        critical_metrics = ['pe_ratio', 'pb_ratio', 'roe', 'profit_margins']
-        df = df.dropna(subset=critical_metrics, thresh=2)  # Keep if at least 2 critical metrics exist
+        # Debug: Check data quality
+        print("\nData quality check:")
+        for col in ['pe_ratio', 'pb_ratio', 'roe', 'profit_margins', 'revenue_growth']:
+            if col in df.columns:
+                valid_count = df[col].notna().sum()
+                print(f"{col}: {valid_count}/{len(df)} valid values")
+        
+        # More lenient cleaning - only remove stocks with ALL critical metrics missing
+        critical_metrics = ['pe_ratio', 'pb_ratio']  # Reduced to just 2 most important
+        initial_count = len(df)
+        df = df.dropna(subset=critical_metrics, how='all')  # Only drop if ALL are missing
+        print(f"After cleaning: {len(df)} stocks (removed {initial_count - len(df)})")
         
         if len(df) == 0:
             print("Warning: No stocks have sufficient data for scoring")
             return pd.DataFrame()
         
-        # Fill remaining NaN values with neutral scores
-        df['pe_ratio'] = df['pe_ratio'].fillna(df['pe_ratio'].median())
-        df['pb_ratio'] = df['pb_ratio'].fillna(df['pb_ratio'].median())
-        df['ps_ratio'] = df['ps_ratio'].fillna(df['ps_ratio'].median())
-        df['peg_ratio'] = df['peg_ratio'].fillna(df['peg_ratio'].median())
-        df['roe'] = df['roe'].fillna(df['roe'].median())
-        df['debt_to_equity'] = df['debt_to_equity'].fillna(df['debt_to_equity'].median())
+        # Fill remaining NaN values with more reasonable defaults
+        # For ratios, use median of available data, for growth use 0
+        numeric_columns = ['pe_ratio', 'pb_ratio', 'ps_ratio', 'peg_ratio', 'roe', 
+                          'debt_to_equity', 'profit_margins']
+        
+        for col in numeric_columns:
+            if col in df.columns:
+                if df[col].notna().sum() > 0:  # If we have any valid values
+                    median_val = df[col].median()
+                    df[col] = df[col].fillna(median_val)
+                else:
+                    # If no valid values, use reasonable defaults
+                    defaults = {
+                        'pe_ratio': 20, 'pb_ratio': 2.5, 'ps_ratio': 3, 'peg_ratio': 1.5,
+                        'roe': 0.12, 'debt_to_equity': 0.5, 'profit_margins': 0.08
+                    }
+                    df[col] = df[col].fillna(defaults.get(col, 0))
+        
+        # Revenue growth defaults to 0 if missing
         df['revenue_growth'] = df['revenue_growth'].fillna(0)
-        df['profit_margins'] = df['profit_margins'].fillna(df['profit_margins'].median())
         
         scores_df = pd.DataFrame()
         scores_df['symbol'] = df['symbol']
@@ -109,6 +130,8 @@ class StockValuationModel:
         scores_df['sector'] = df['sector']
         scores_df['price'] = df['price']
         scores_df['market_cap'] = df['market_cap']
+        
+        print(f"\nCalculating scores for {len(df)} stocks...")
         
         # P/E Score (lower is better)
         pe_percentile = df['pe_ratio'].rank(pct=True)
@@ -163,7 +186,9 @@ class StockValuationModel:
         scores_df['profit_margins'] = df['profit_margins']
         scores_df['debt_to_equity'] = df['debt_to_equity']
         
-        self.scores = scores_df.sort_values('composite_score')
+        self.scores = scores_df.sort_values('composite_score').reset_index(drop=True)
+        print(f"Scoring complete! Top stock: {self.scores.iloc[0]['symbol']} with score {self.scores.iloc[0]['composite_score']:.1f}")
+        
         return self.scores
     
     def screen_stocks(self, criteria):
@@ -195,8 +220,14 @@ class StockValuationModel:
             print("No scores calculated. Run calculate_valuation_score() first.")
             return
         
-        # Clean data for plotting - remove any remaining NaN values
-        plot_data = self.scores.dropna(subset=['pe_ratio', 'pb_ratio', 'roe', 'revenue_growth', 'composite_score'])
+        print(f"Starting plot with {len(self.scores)} stocks")
+        
+        # Much more lenient data cleaning for plotting
+        plot_data = self.scores.copy()
+        
+        # Only remove truly problematic values, keep most data
+        plot_data = plot_data[plot_data['composite_score'].notna()]
+        print(f"After removing NaN composite scores: {len(plot_data)} stocks")
         
         if len(plot_data) == 0:
             print("No data available for plotting after cleaning.")
@@ -204,44 +235,60 @@ class StockValuationModel:
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         
-        # Top 10 undervalued stocks
+        # Top 10 undervalued stocks - this should always work
         top_10 = plot_data.head(10)
         axes[0, 0].barh(top_10['symbol'], top_10['composite_score'])
         axes[0, 0].set_title('Top 10 Undervalued Stocks (Lower Score = Better Value)')
         axes[0, 0].set_xlabel('Composite Valuation Score')
         
-        # PE vs PB scatter - filter out extreme outliers
-        pe_clean = plot_data[(plot_data['pe_ratio'] > 0) & (plot_data['pe_ratio'] < 100)]
-        pb_clean = pe_clean[(pe_clean['pb_ratio'] > 0) & (pe_clean['pb_ratio'] < 20)]
+        # PE vs PB scatter - be more lenient with outliers
+        pe_data = plot_data[plot_data['pe_ratio'].notna() & plot_data['pb_ratio'].notna()]
+        pe_clean = pe_data[(pe_data['pe_ratio'] > 0) & (pe_data['pe_ratio'] < 200)]  # More lenient
+        pb_clean = pe_clean[(pe_clean['pb_ratio'] > 0) & (pe_clean['pb_ratio'] < 50)]  # More lenient
         
-        if len(pb_clean) > 0:
+        print(f"P/E vs P/B plot data: {len(pb_clean)} stocks")
+        
+        if len(pb_clean) > 1:
             scatter1 = axes[0, 1].scatter(pb_clean['pe_ratio'], pb_clean['pb_ratio'], 
                               c=pb_clean['composite_score'], cmap='RdYlGn_r', alpha=0.7)
             axes[0, 1].set_xlabel('P/E Ratio')
             axes[0, 1].set_ylabel('P/B Ratio')
             axes[0, 1].set_title('P/E vs P/B Ratio (Color = Valuation Score)')
-            plt.colorbar(scatter1, ax=axes[0, 1])
+            try:
+                plt.colorbar(scatter1, ax=axes[0, 1])
+            except:
+                pass  # Skip colorbar if it fails
         else:
-            axes[0, 1].text(0.5, 0.5, 'Insufficient clean data for P/E vs P/B plot', 
+            axes[0, 1].text(0.5, 0.5, f'Insufficient clean data for P/E vs P/B plot\n({len(pb_clean)} stocks)', 
                            ha='center', va='center', transform=axes[0, 1].transAxes)
         
-        # ROE vs Revenue Growth
-        roe_clean = plot_data[(plot_data['roe'] >= -1) & (plot_data['roe'] <= 2)]  # Remove extreme ROE values
-        growth_clean = roe_clean[(roe_clean['revenue_growth'] >= -0.5) & (roe_clean['revenue_growth'] <= 1)]
+        # ROE vs Revenue Growth - be more lenient
+        roe_data = plot_data[plot_data['roe'].notna() & plot_data['revenue_growth'].notna()]
+        roe_clean = roe_data[(roe_data['roe'] >= -2) & (roe_data['roe'] <= 5)]  # Very lenient
+        growth_clean = roe_clean[(roe_clean['revenue_growth'] >= -1) & (roe_clean['revenue_growth'] <= 2)]
         
-        if len(growth_clean) > 0:
+        print(f"ROE vs Growth plot data: {len(growth_clean)} stocks")
+        
+        if len(growth_clean) > 1:
             scatter2 = axes[1, 0].scatter(growth_clean['roe'], growth_clean['revenue_growth'], 
                               c=growth_clean['composite_score'], cmap='RdYlGn_r', alpha=0.7)
             axes[1, 0].set_xlabel('Return on Equity')
             axes[1, 0].set_ylabel('Revenue Growth')
             axes[1, 0].set_title('ROE vs Revenue Growth')
-            plt.colorbar(scatter2, ax=axes[1, 0])
+            try:
+                plt.colorbar(scatter2, ax=axes[1, 0])
+            except:
+                pass  # Skip colorbar if it fails
         else:
-            axes[1, 0].text(0.5, 0.5, 'Insufficient clean data for ROE vs Growth plot', 
+            axes[1, 0].text(0.5, 0.5, f'Insufficient clean data for ROE vs Growth plot\n({len(growth_clean)} stocks)', 
                            ha='center', va='center', transform=axes[1, 0].transAxes)
         
         # Score distribution by sector
-        sector_scores = plot_data.groupby('sector')['composite_score'].mean().sort_values()
+        sector_data = plot_data[plot_data['sector'].notna()]
+        sector_scores = sector_data.groupby('sector')['composite_score'].mean().sort_values()
+        
+        print(f"Sector analysis: {len(sector_scores)} sectors")
+        
         if len(sector_scores) > 0:
             axes[1, 1].bar(range(len(sector_scores)), sector_scores.values)
             axes[1, 1].set_xticks(range(len(sector_scores)))
@@ -254,6 +301,7 @@ class StockValuationModel:
         
         plt.tight_layout()
         plt.show()
+        print("Visualization complete!")
     
     def generate_report(self, top_n=10):
         """
